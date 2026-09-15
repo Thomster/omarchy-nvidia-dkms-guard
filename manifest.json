@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "nvidia-dkms-guard",
+  "name": "NVIDIA dkms Guard",
+  "version": "1.0.0",
+  "author": "Omarchy",
+  "description": "Detects an NVIDIA GPU (built-in or eGPU) whose dkms module is out of sync with the running kernel, or that nouveau claimed instead of nvidia, and notifies you to run the bundled fix. No bar icon.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

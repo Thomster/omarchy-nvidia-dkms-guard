@@ -1,0 +1,239 @@
+#!/bin/bash
+# omarchy-nvidia-dkms-guard
+#
+# Detects two failure modes around an nvidia-dkms/nvidia-open-dkms install
+# on Arch/Omarchy where an NVIDIA GPU (built-in or, commonly, a
+# Thunderbolt/USB4 eGPU enclosure) ends up with no working driver:
+#
+#   1. dkms module out of sync with the running kernel -- e.g. after a
+#      kernel update, `dkms status` shows the nvidia module built for an
+#      old kernel version but not the one you just booted into (a silent
+#      dkms rebuild failure, often due to linux-headers not being updated
+#      in lockstep, or the dkms pacman hook failing quietly).
+#   2. nouveau grabbed the card instead of nvidia -- either because
+#      /etc/modprobe.d/blacklist-nouveau.conf was never created, or it
+#      was created but the initramfs/UKI hasn't been rebuilt since (so
+#      the running boot still has nouveau able to autoload).
+#
+# Neither failure is obvious from a running desktop: the screen usually
+# still works fine on Intel/AMD-integrated graphics, and an eGPU without a
+# working nvidia driver just silently sits there instead of erroring
+# loudly. This script only detects and reports -- it never rmmod's a live
+# module or reboots. Fixing case 2 fully always needs a reboot; this only
+# stages the files for that reboot.
+#
+# Usage:
+#   omarchy-nvidia-dkms-guard --check [--quiet]   # read-only; exit 0 = fine, 1 = needs fix, 2 = staged, reboot to finish
+#   sudo omarchy-nvidia-dkms-guard [--force]      # apply what can be fixed without a reboot
+#
+# --force skips the detection gate and runs the fix steps regardless.
+
+set -uo pipefail
+
+BLACKLIST_FILE="/etc/modprobe.d/blacklist-nouveau.conf"
+LIMINE_MKINITCPIO="/usr/share/libalpm/scripts/limine-mkinitcpio-install"
+
+MODE="fix"
+QUIET=0
+FORCE=0
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  omarchy-nvidia-dkms-guard --check [--quiet]
+      Read-only. Prints what it finds. Exit 0 = nothing to do (no NVIDIA
+      GPU present, or the driver is correctly bound and dkms matches the
+      running kernel). Exit 1 = a fix is needed and hasn't been applied.
+      Exit 2 = the fix has already been staged (dkms module built,
+      blacklist in place) but nouveau is still loaded from before the
+      fix -- just reboot, don't re-run the fix.
+
+  sudo omarchy-nvidia-dkms-guard [--force]
+      Rebuilds the dkms module for the running kernel if missing, writes
+      /etc/modprobe.d/blacklist-nouveau.conf if missing (backed up if it
+      already exists with different content), and rebuilds the
+      initramfs/UKI via limine-mkinitcpio-install if present. Refuses to
+      do anything unless the detection check finds a problem, unless
+      --force is given. Always reboot afterward -- nouveau already loaded
+      in the running session can't be swapped out live.
+USAGE
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --check) MODE="check" ;;
+    --fix) MODE="fix" ;;
+    --force) FORCE=1 ;;
+    --quiet) QUIET=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+log() { (( QUIET )) || echo "$@"; }
+
+running_kernel() { uname -r; }
+
+# Every NVIDIA (vendor 10de) display-class (VGA/3D/display) PCI device
+# currently on the bus. Empty if no NVIDIA GPU is present right now --
+# e.g. an eGPU dock that's unplugged. In that case there's nothing to
+# check, not a failure.
+nvidia_pci_devices() {
+  # lspci's -d class filter needs an exact-width class code (0300, 0302,
+  # ...), not a "03" prefix -- so list all 10de: devices and filter on the
+  # bracketed class code ourselves to catch VGA (0300), 3D (0302), and
+  # display controllers (0380) alike.
+  lspci -D -nn -d 10de: 2>/dev/null | awk -F'[][]' '$2 ~ /^03/ {print $1}' | cut -d' ' -f1
+}
+
+dkms_module_current() {
+  command -v dkms >/dev/null 2>&1 || return 1
+  dkms status 2>/dev/null | grep -q "^nvidia/.*$(running_kernel).*: installed"
+}
+
+dkms_module_stale() {
+  command -v dkms >/dev/null 2>&1 || return 1
+  local status
+  status=$(dkms status 2>/dev/null | grep '^nvidia/')
+  [[ -n "$status" ]] || return 1
+  ! grep -q "$(running_kernel)" <<<"$status"
+}
+
+bound_driver_for() {
+  lspci -k -s "${1#0000:}" 2>/dev/null | sed -n 's/.*Kernel driver in use: //p'
+}
+
+# True if any present NVIDIA GPU is NOT bound to nvidia -- whether that's
+# because nouveau claimed it instead, or because nothing is bound to it at
+# all. Both are the same practical problem (no working driver) and the
+# same fix (blacklist nouveau, make sure dkms is current, reboot), so they
+# aren't distinguished further. In practice nouveau can also be *loaded*
+# without being *bound* -- e.g. it attempts to probe an Ampere eGPU and
+# fails ("unable to map PRI" in dmesg is one seen signature) -- so an
+# empty "Kernel driver in use" line is just as real a symptom as nouveau
+# actually owning the device.
+nvidia_bound_to_all_gpus() {
+  local dev driver any=0
+  for dev in $(nvidia_pci_devices); do
+    any=1
+    driver=$(bound_driver_for "$dev")
+    [[ "$driver" == "nvidia" ]] || return 1
+  done
+  (( any )) || return 1
+  return 0
+}
+
+blacklist_present() {
+  [[ -f "$BLACKLIST_FILE" ]] && grep -qw nouveau "$BLACKLIST_FILE"
+}
+
+run_check() {
+  if [[ -z "$(nvidia_pci_devices)" ]]; then
+    log "No NVIDIA GPU currently on the PCI bus (eGPU dock unplugged, or none present). Nothing to check."
+    return 0
+  fi
+
+  if nvidia_bound_to_all_gpus && dkms_module_current; then
+    log "nvidia is bound to every NVIDIA GPU present, and the dkms module matches the running kernel ($(running_kernel)). Nothing to do."
+    return 0
+  fi
+
+  if blacklist_present && dkms_module_current; then
+    log "The fix is already staged (blacklist in place, dkms module built for $(running_kernel)) but an NVIDIA GPU still isn't bound to nvidia in this running session."
+    log "Reboot to activate it: systemctl reboot"
+    return 2
+  fi
+
+  if dkms_module_stale; then
+    log "dkms has an nvidia module built, but not for the running kernel ($(running_kernel)) -- likely a kernel update the dkms rebuild didn't keep up with."
+    log "Run: sudo $0"
+    return 1
+  fi
+
+  if ! blacklist_present; then
+    log "An NVIDIA GPU is present but not bound to nvidia, and nothing is blacklisting nouveau ($BLACKLIST_FILE is missing)."
+    log "Run: sudo $0"
+    return 1
+  fi
+
+  log "An NVIDIA GPU is present and not bound to nvidia, despite dkms and the blacklist both looking correct -- check dmesg for a probe failure and re-run with --force if you want the fix steps repeated anyway."
+  return 1
+}
+
+backup_file() {
+  local file="$1"
+  [[ -f "$file" ]] && cp -p "$file" "$file.bak.$(date +%s)"
+}
+
+rebuild_dkms_module() {
+  local version
+  version=$(dkms status 2>/dev/null | grep '^nvidia/' | head -1 | cut -d, -f1 | cut -d/ -f2)
+  if [[ -z "$version" ]]; then
+    log "Could not determine the installed nvidia dkms version from 'dkms status'. Is nvidia-open-dkms/nvidia-dkms actually installed?"
+    return 1
+  fi
+  if ! pacman -Q linux-headers >/dev/null 2>&1; then
+    log "linux-headers isn't installed -- dkms can't build against $(running_kernel) without it. Run: sudo pacman -S linux-headers, then re-run this script."
+    return 1
+  fi
+  log "Rebuilding nvidia/$version dkms module for $(running_kernel)..."
+  dkms install --no-depmod "nvidia/$version" -k "$(running_kernel)" && depmod "$(running_kernel)"
+}
+
+write_blacklist() {
+  if blacklist_present; then
+    log "$BLACKLIST_FILE already blacklists nouveau."
+    return 0
+  fi
+  backup_file "$BLACKLIST_FILE"
+  echo "blacklist nouveau" > "$BLACKLIST_FILE"
+  log "Wrote $BLACKLIST_FILE."
+}
+
+rebuild_initramfs() {
+  if [[ -x "$LIMINE_MKINITCPIO" ]]; then
+    log "Rebuilding the initramfs/UKI via $LIMINE_MKINITCPIO..."
+    "$LIMINE_MKINITCPIO"
+  elif command -v mkinitcpio >/dev/null 2>&1; then
+    log "No Limine UKI script found; falling back to mkinitcpio -P..."
+    mkinitcpio -P
+  else
+    log "Could not find a way to rebuild the initramfs automatically. Do it manually for your bootloader."
+    return 1
+  fi
+}
+
+run_fix() {
+  if (( EUID != 0 )); then
+    echo "This needs root. Re-run as: sudo $0 ${*:-}" >&2
+    exit 1
+  fi
+
+  local did_something=0
+
+  if (( FORCE )) || dkms_module_stale; then
+    rebuild_dkms_module && did_something=1
+  fi
+
+  if (( FORCE )) || { [[ -n "$(nvidia_pci_devices)" ]] && ! nvidia_bound_to_all_gpus && ! blacklist_present; }; then
+    write_blacklist && did_something=1
+    rebuild_initramfs && did_something=1
+  fi
+
+  if (( ! did_something )); then
+    log "No symptoms detected and --force wasn't given. Nothing to do."
+    exit 0
+  fi
+
+  log
+  log "Done. Reboot to test: systemctl reboot"
+  log "After rebooting, verify with:"
+  log "  dkms status"
+  log "  lspci -k | grep -A3 NVIDIA   # should say 'Kernel driver in use: nvidia'"
+  log "  nvidia-smi"
+}
+
+case "$MODE" in
+  check) run_check; exit $? ;;
+  fix) run_fix ;;
+esac
