@@ -99,6 +99,10 @@ dock itself also has PCIe issues (missing USB/Ethernet behind the dock) —
 that one's a firmware BAR-allocation bug, this one's a driver-binding
 bug; they're unrelated but tend to show up on the same kind of hardware.
 
+## Changelog
+
+Current version: **1.0.1**. See [CHANGELOG.md](CHANGELOG.md).
+
 ## How this came to be
 
 This is a personal customization for my own Omarchy setup, built with the
