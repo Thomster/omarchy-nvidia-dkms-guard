@@ -99,6 +99,12 @@ dock itself also has PCIe issues (missing USB/Ethernet behind the dock) —
 that one's a firmware BAR-allocation bug, this one's a driver-binding
 bug; they're unrelated but tend to show up on the same kind of hardware.
 
+The opposite case — NVIDIA userspace drivers that Steam pulled onto a
+machine *without* an NVIDIA GPU — is handled by
+[`omarchy-steam-nvidia-cleanup`](https://github.com/Thomster/omarchy-steam-nvidia-cleanup).
+It stays out of the way of this guard: an installed NVIDIA kernel driver
+blocks its cleanup, even when the eGPU is unplugged.
+
 ## Changelog
 
 Current version: **1.0.1**. See [CHANGELOG.md](CHANGELOG.md).
